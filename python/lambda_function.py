@@ -1,3 +1,4 @@
+import json
 import boto3
 import csv
 import io
@@ -63,26 +64,19 @@ def parse_user_account_control(uac):
         "Flags": ", ".join(decoded_flags)
     }
 
-
 def lambda_handler(event, context):
     region = event.get('region', 'us-east-1')
     inactivity_days = int(event.get('inactivity_days', 60))
-    s3_bucket = event['s3_bucket']
+
+    secret_name = event.get('secret_name', 'ldap/service-account')
+    
+    s3_bucket = event['s3_bucket']    
     report_suffix = datetime.utcnow().strftime('%Y-%B')  # e.g., 2025-April
     s3_key = event.get('s3_key', f'workspaces/workspacesreport-{report_suffix}.csv')
+    
     email_recipients = event.get('email_recipients', [])
     topic_arn = event.get('topic_arn', 'arn:aws:sns:us-east-1:067240469062:workspace-report-notification')
     topic_subject = event.get('topic_subject', 'Your WorkSpaces report is ready')
-
-    # Environment variables for LDAP and SMTP
-    ad_host = os.environ['AD_HOST']
-    ad_user = os.environ['AD_USERNAME']
-    ad_pass = os.environ['AD_PASSWORD']
-    base_dn = os.environ['BASE_DN'] #'DC=sila,DC=local'
-
-    start_time = datetime.utcnow() - timedelta(days=inactivity_days)
-    end_time = datetime.utcnow()
-    period = 86400
 
     # AWS Clients
     workspaces_client = boto3.client(
@@ -110,15 +104,36 @@ def lambda_handler(event, context):
         region_name=region,
         endpoint_url='https://vpce-005dcfed0fb7b48f1-ou4t236l.sns.us-east-1.vpce.amazonaws.com'
     )
+    sm = boto3.client(
+        'secretsmanager', 
+        region_name=region,
+        endpoint_url='https://vpce-0b4f1e3e765617702-hxwk0xnw.secretsmanager.us-east-1.vpce.amazonaws.com'
+    )
+
+    # Environment variables for LDAP connection
+    ad_host = os.environ['AD_HOST']
+    base_dn = os.environ['BASE_DN']
+
+    # Get AD service account credentils from Secrets Manager
+    secret_value = sm.get_secret_value(SecretId=secret_name)
+    creds = json.loads(secret_value['SecretString'])
+    ad_user = creds['username']
+    ad_pass = creds['password']
  
     # LDAP Connection
     server = Server(ad_host, port=389, get_info=ALL)
     conn = Connection(server, user=ad_user, password=ad_pass, auto_bind=True)
     
+    # Get WorkSpaces information
     workspaces = get_all_workspaces(workspaces_client)
     print(f"Found {len(workspaces)} workspaces")
 
     report_rows = []
+
+    # Setup CloudWatch metrics parameters
+    start_time = datetime.utcnow() - timedelta(days=inactivity_days)
+    end_time = datetime.utcnow()
+    period = 86400
 
     for ws in workspaces:
         try:
