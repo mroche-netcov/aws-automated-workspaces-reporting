@@ -2,17 +2,31 @@
 param (
     [Parameter()]
     [System.String]
-    $Path = "C:\Temp\",
-
-    [Parameter(Mandatory = $true)]
-    [ValidateSet("us-east-1", "us-west-2", "ap-northeast-2", "ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "ca-central-1", "eu-central-1", "eu-west-1", "eu-west-2", "sa-east-1")]
-    [System.String]
-    $Region,
+    $Path = "C:\Temp",
     
     [Parameter()]
     [ValidatePattern("^\d{1,3}$")]
     [System.Int32]
-    $InactiveDays = 60
+    $InactiveDays = 60,
+    
+    [Parameter(Mandatory = $true)]
+    [System.String]
+    $LdapServer,
+
+    [Parameter()]
+    [System.Int32]
+    $LdapPort = 389,
+
+    [Parameter(Mandatory = $true)]
+    [System.String]
+    $LdapSearchBase,
+
+    [Parameter()]
+    [System.Management.Automation.PSCredential]
+    $Credential = (Get-Credential -Message "Enter LDAP credentials"),
+    
+    [Parameter(Mandatory = $true)]
+    $ProfileName
 )
 
 # Helper function to parse userAccountControl flags
@@ -69,7 +83,7 @@ function Resolve-ManagerDisplayName {
     )
 
     try {
-        $response = $connection.SendRequest($request)
+        $response = $Connection.SendRequest($request)
         if ($response.Entries.Count -gt 0) {
             return $response.Entries[0].Attributes["displayName"][0]
         } else {
@@ -103,7 +117,7 @@ function Search-Ldap {
         )
         $searchRequest.Controls.Add($pageControl)
 
-        $searchResponse = $connection.SendRequest($searchRequest)
+        $searchResponse = $Connection.SendRequest($searchRequest)
 
         foreach ($entry in $searchResponse.Entries) {
             $result = @{}
@@ -146,52 +160,40 @@ function Search-Ldap {
     return $allResults
 }
 
-Import-Module AWS.Tools.Common, AWS.Tools.WorkSpaces, AWS.Tools.CloudWatch
-
-$Path = "C:\Temp\"
+Import-Module AWS.Tools.Common, AWS.Tools.WorkSpaces, AWS.Tools.CloudWatch, AWS.Tools.DirectoryService, AWS.Tools.EC2
 
 if (-not(Test-Path $Path)) {New-Item -ItemType Directory -Path $Path | Out-Null}
-if ($InactiveDays -ge 455) {Write-Host ('CloudWatch aggregates log data so you may need to modify the period queried per this link{0}https://aws.amazon.com/about-aws/whats-new/2016/11/cloudwatch-extends-metrics-retention-and-new-user-interface/' -f $([Environment]::NewLine))}
 
+<# if ($InactiveDays -ge 455) {Write-Host ('CloudWatch aggregates log data so you may need to modify the period queried per this link{0}https://aws.amazon.com/about-aws/whats-new/2016/11/cloudwatch-extends-metrics-retention-and-new-user-interface/' -f $([Environment]::NewLine))}
+
+# CloudWatch metrics are aggregate from the WorkSpce client. If the proper ports are not open, the client will not be able to send metrics to CloudWatch. The following ports must be open for the WorkSpaces client to send metrics to CloudWatch:
+# 1. TCP 443 (HTTPS) - For the WorkSpaces client to communicate with the WorkSpaces service
 $StartDate = (Get-Date).AddDays(-$InactiveDays)
 $EndDate = Get-Date
 
 $Dimension = New-Object Amazon.CloudWatch.Model.Dimension
 $Dimension.set_Name("WorkspaceId")
 # Setting this to 1 day (60 seconds * 60 minutes * 24 hours in a day) to allow querying larger data points - see above link relating to CloudWatch metrics aggregation
-$Period = 86400
+$Period = 86400 #>
 
-$WorkSpaces = Get-WKSWorkspace -ProfileName sila-prod | Select-Object UserName, ComputerName, WorkspaceId, IpAddress, DirectoryId, BundleId, SubnetId, State, RootVolumeEncryptionEnabled, UserVolumeEncryptionEnabled, WorkspaceProperties
+
+# Create the LDAP directory identifier
+$Identifier = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($LdapServer, $LdapPort)
+
+# Create the LDAP connection
+$Connection = New-Object System.DirectoryServices.Protocols.LdapConnection($Identifier, $Credential)
+
+# Set the LDAP protocal version
+$Connection.SessionOptions.ProtocolVersion = 3 
+
+# Bind the connection
+$Connection.Bind()
+
+$WorkSpaces = Get-WKSWorkspace -ProfileName $ProfileName | Select-Object UserName, ComputerName, WorkspaceId, IpAddress, DirectoryId, BundleId, SubnetId, State, RootVolumeEncryptionEnabled, UserVolumeEncryptionEnabled, WorkspaceProperties
 $WorkSpacesCount = $WorkSpaces.Count
 Write-Host ('Capturing info for {0} WorkSpaces' -f  $WorkSpacesCount)
 
 $Report = @()
-
-# Define the LDAP server and port
-$server = '54.224.216.23'
-$port = 389
-
-# Define the credentials
-$domain = 'sila'
-$username = 'ncitech'
-$password = 'WiaD&0Miz65M#%'
-$credential = New-Object -TypeName pscredential -ArgumentList ('{0}\{1}' -f $domain, $username), (ConvertTo-SecureString -String $password -AsPlainText -Force)
-
-# Create the LDAP directory identifier
-$identifier = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($server, $port)
-
-# Create the LDAP connection
-$connection = New-Object System.DirectoryServices.Protocols.LdapConnection($identifier, $credential)
-
-# Set the LDAP protocal version
-$connection.SessionOptions.ProtocolVersion = 3 
-
-# Bind the connection
-$connection.Bind()
-
-$searchBase = "DC=sila,DC=local"
-
-
 foreach ($WorkSpace in $WorkSpaces){
     Write-Host ("Enumerating workspace {0} assigned to user {1}" -f $WorkSpace.WorkspaceId, $WorkSpace.UserName)
     $UserName = $WorkSpace.UserName
@@ -199,28 +201,20 @@ foreach ($WorkSpace in $WorkSpaces){
 
     
     # Search for user information
-    $filter = "(sAMAccountName=$userName)"
-    $attributes = @("cn", "sAMAccountName", "displayName", "mail", "department", "mobile", "manager", "userAccountControl")
-    
+    $UserFilter = "(sAMAccountName=$userName)"
+    $UserAttributes = @("cn", "sAMAccountName", "displayName", "mail", "department", "mobile", "manager", "userAccountControl")
+    $ADUserInfo = Search-Ldap -filter $UserFilter -attributes $UserAttributes -searchBase $LdapSearchBase
 
-    $ADUserInfo = Search-Ldap -filter $filter -attributes $attributes -searchBase $searchBase
+    $ComputerFilter = "(cn=$computerName)"
+    $ComputerAttributes = @("cn", "name", "whenCreated", "operatingSystem", "dNSHostName", "userAccountControl", "lastLogonTimestamp")
+    $ADComputerInfo = Search-Ldap -filter $ComputerFilter -attributes $ComputerAttributes -searchBase $LdapSearchBase
 
-    $computerFilter = "(cn=$computerName)"
-    $computerAttributes = @("whenCreated", "operatingSystem")
-    $computerattributes = @("cn", "name", "whenCreated", "operatingSystem", "dNSHostName", "userAccountControl", "lastLogonTimestamp")
-
-    $ADcomputerInfo = Search-Ldap -filter $computerFilter -attributes $computerAttributes -searchBase $searchBase
-
-
-
-
-    #$ADUserInfo = Get-ADUser -Filter {SamAccountName -eq $UserName} -Properties Name, Enabled, Department, EmailAddress, Manager, MobilePhone | Select-Object *, @{Label = "ADUserManager"; Expression = {(Get-ADUser $_.Manager -Properties DisplayName).DisplayName}}
-    #$ADComputerInfo = Get-ADComputer -Filter {Name -eq $ComputerName} -Properties Created, OperatingSystem
-    $WorkSpaceConnectionInfo = Get-WKSWorkspacesConnectionStatus -WorkspaceId $WorkSpace.WorkspaceId -ProfileName sila-prod
-    $WorkSpaceSubnetInfo = Get-EC2Subnet -SubnetId $WorkSpace.SubnetId -ProfileName sila-prod
+    # The code block below does not work as expected and/or does not provide value. It is commented out for now.
+    <# $WorkSpaceConnectionInfo = Get-WKSWorkspacesConnectionStatus -WorkspaceId $WorkSpace.WorkspaceId -ProfileName $ProfileName
+    $WorkSpaceSubnetInfo = Get-EC2Subnet -SubnetId $WorkSpace.SubnetId -ProfileName $ProfileName
     
     $Dimension.set_Value($WorkSpace.WorkspaceId)
-    $Data = Get-CWMetricStatistics -Namespace "AWS/WorkSpaces" -MetricName "ConnectionSuccess" -UtcStartTime $StartDate -UtcEndTime $EndDate -Period $period -Statistics @("Maximum") -Dimensions @($dimension) -ProfileName sila-prod
+    $Data = Get-CWMetricStatistics -Namespace "AWS/WorkSpaces" -MetricName "ConnectionSuccess" -UtcStartTime $StartDate -UtcEndTime $EndDate -Period $period -Statistics @("Maximum") -Dimensions @($dimension) -ProfileName $ProfileName
     if (($Data.Datapoints.Maximum | Sort-Object -Unique | Select-Object -Last 1) -ge 1) {
         # logins found
         $WorkSpaceUnused = $false
@@ -228,94 +222,40 @@ foreach ($WorkSpace in $WorkSpaces){
     else {
         # no logins found
         $WorkSpaceUnused = $true
-    }
-         
-
+    } #>
 
     # Build the report object with all required properties
     $obj = New-Object -TypeName PSObject -Property @{
+        "FullName" = $ADUserInfo.displayName
         "UserName" = $WorkSpace.UserName
-        "ADUserFullName" = $ADUserInfo.cn
-        "ADUserDepartment" = $ADUserInfo.Department
-        "ADUserEnabled" = $ADUserInfo.Enabled
-        "ADUserEmailAddress" = $ADUserInfo.mail
-        "ADUserManager" = $ADUserInfo.ManagerDisplayName
-        "ADUserMobilePhone" = $ADUserInfo.MobilePhone
+        "EmailAddress" = $ADUserInfo.mail
+        "UserEnabled" = $ADUserInfo.Enabled
         "ComputerName" = $WorkSpace.ComputerName
-        "ADComputerCreated" = $ADComputerInfo.whenCreated
-        "ADComputerOperatingSystem" = $ADComputerInfo.OperatingSystem
-        "ADComputerLastLogonDate" = $ADcomputerInfo.LastLogonDate
-        "ADComputerEnabed" = $ADcomputerInfo.Enabled
-        "ADComputerFullyQualifiedDomainName" = $ADcomputerInfo.dNSHostName
+        "ComputerFullName" = $ADComputerInfo.dNSHostName
+        "ComputerEnabed" = $ADComputerInfo.Enabled
+        "ComputerCreated" = $ADComputerInfo.whenCreated
+        "ComputerLastLogonDate" = $ADComputerInfo.LastLogonDate
         "WorkSpaceId" = $WorkSpace.WorkspaceId
-        "ConnectionState" = $WorkSpaceConnectionInfo.ConnectionState
-        "ConnectionStateCheckTimestamp" = $WorkSpaceConnectionInfo.ConnectionStateCheckTimestamp
-        "LastKnownUserConnectionTimestamp" = $WorkSpaceConnectionInfo.LastKnownUserConnectionTimestamp
-        "WorkSpaceUnusedForDefinedPeriod" = $WorkSpaceUnused
-        "WorkSpaceState" = $WorkSpace.State
-        "ComputeType" = $WorkSpace.WorkspaceProperties.ComputeTypeName
-        "IpAddress" = $WorkSpace.IpAddress
-        "Directory" = (get-dsdirectory -ProfileName sila-prod -DirectoryID $WorkSpace.DirectoryId).alias
-        "DirectoryId" = $WorkSpace.DirectoryId
-        "Bundle" = (Get-WKSWorkspaceBundle -ProfileName sila-prod -BundleId $WorkSpace.BundleId).Name
-        "BundleId" = $WorkSpace.BundleId
-        "SubnetLabel" =  $WorkSpaceSubnetInfo.Tag.Where({$_.Key -eq "Name"}).value
-        "SubnetId" = $WorkSpace.SubnetId
-        "SubnetAZ" = $WorkSpaceSubnetInfo.AvailabilityZone
-        "SubnetAZId" = $WorkSpaceSubnetInfo.AvailabilityZoneId
-        "SubnetAvailableIpAddressCount" = $WorkSpaceSubnetInfo.AvailableIpAddressCount
-        "RootEncryption" = $WorkSpace.RootVolumeEncryptionEnabled
-        "RootVolumeSizeGib" = $WorkSpace.WorkspaceProperties.RootVolumeSizeGib
-        "UserEncryption" = $WorkSpace.UserVolumeEncryptionEnabled
-        "UserVolumeSizeGib" = $WorkSpace.WorkspaceProperties.UserVolumeSizeGib
-        "RunningMode" = $WorkSpace.WorkspaceProperties.RunningMode
-        "TimeoutMinutes" = $WorkSpace.WorkspaceProperties.RunningModeAutoStopTimeoutInMinutes
+        "WorkSpaceComputeType" = $WorkSpace.WorkspaceProperties.ComputeTypeName
+        "WorkSpaceRunningMode" = $WorkSpace.WorkspaceProperties.RunningMode
+        "WorkSpaceIpAddress" = $WorkSpace.IpAddress
+        "WorkSpaceDirectory" = (Get-DSDirectory -ProfileName $ProfileName -DirectoryID $WorkSpace.DirectoryId).Alias
+        "WorkSpaceBundleName" = (Get-WKSWorkspaceBundle -ProfileName $ProfileName -BundleId $WorkSpace.BundleId).Name
+        "WorkSpaceSubnetId" = $WorkSpace.SubnetId
     }
     
     # Append each WorkSpace to the report object so all objects can be written to disk at the same time
-    $report += $obj | Select-Object UserName, `
-    ADUserFullName, ` `
-    ADUserEnabled, `
-    ComputerName, `
-    ADComputerEnabed, `
-    ADComputerCreated, `
-    ADComputerOperatingSystem, `
-    ADComputerLastLogonDate, 
-    ADComputerFullyQualifiedDomainName, `
-    WorkSpaceId, `
-    ConnectionState, `
-    ConnectionStateCheckTimestamp, `
-    LastKnownUserConnectionTimestamp, `
-    WorkSpaceUnusedForDefinedPeriod, `
-    WorkSpaceState, `
-    ComputeType, `
-    ipaddress, `
-    Directory, `
-    directoryid, `
-    Bundle, `
-    bundleid, `
-    SubnetLabel, `
-    SubnetId, `
-    SubnetAZ, `
-    SubnetAZId, `
-    SubnetAvailableIpAddressCount, `
-    RootEncryption, `
-    RootVolumeSizeGib, `
-    UserEncryption, `
-    UserVolumeSizeGib, `
-    RunningMode, `
-    TimeoutMinutes, `
-    ADUserDepartment,
-    ADUserEmailAddress, `
-    ADUserManager, `
-    ADUserMobilePhone
+    $Report += $obj | Select-Object -Property FullName, UserName, EmailAddress, UserEnabled, ComputerName, ComputerFullName, ComputerEnabed, ComputerCreated, ComputerLastLogonDate, WorkSpaceId, WorkSpaceComputeType, WorkSpaceRunningMode, WorkSpaceIpAddress, WorkSpaceDirectory, WorkSpaceBundleName, WorkSpaceSubnetId
+    
     # Decrement the count of WorkSpaces so the user sees a progress indicator
     $WorkSpacesCount--
     Write-Host "$($WorkSpacesCount) WorkSpaces remain"
+    
     # Delay to prevent AWS API Throttling
     Start-Sleep -Milliseconds 750
 }
 
-$report | Sort-Object UserName, Directory | Export-Csv  ($Path + "workspacesreport.csv") -notypeinformation -Append
+$Report | Sort-Object UserName, Directory | Export-Csv -Path (Join-Path -Path -ChildPath ('workspacesreport-{0}.csv' -f (Get-Date -Format "yyyy-MMMM"))) -NoTypeInformation -Append
+
 # Dispose of the connection when done
-$connection.Dispose()
+$Connection.Dispose()
